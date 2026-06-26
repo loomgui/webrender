@@ -1344,11 +1344,27 @@ fn prepare_interned_prim_for_render(
                     for instance in source_masks {
                         let clip_instance = frame_state.clip_store.get_instance_from_range(&prim_info.clip_chain.clips_range, instance);
 
+                        // If this mask samples a snapshot rendered earlier this frame,
+                        // make the mask tiles depend on the snapshot's render task so they
+                        // sample it on the same frame. Without it the tile reads a stale
+                        // texture. A static scene that produces only 1-2 frames then never
+                        // resolves the mask (background-clip: text goes blank).
+                        let snapshot_task_id = match data_stores.clip[clip_instance.handle].item.kind {
+                            ClipItemKind::Image { image, .. } => frame_state.image_dependencies.get(&image).copied(),
+                            _ => None,
+                        };
+
                         for tile in frame_state.clip_store.visible_mask_tiles(clip_instance) {
                             frame_state.rg_builder.add_dependency(
                                 parent_task_id,
                                 tile.task_id,
                             );
+                            if let Some(snapshot_task_id) = snapshot_task_id {
+                                frame_state.rg_builder.add_dependency(
+                                    tile.task_id,
+                                    snapshot_task_id,
+                                );
+                            }
                         }
 
                         frame_state.clip_store.clip_node_instances.push(clip_instance.clone());
@@ -1423,11 +1439,24 @@ fn prepare_interned_prim_for_render(
                     for instance in target_masks {
                         let clip_instance = frame_state.clip_store.get_instance_from_range(&prim_info.clip_chain.clips_range, instance);
 
+                        // See the source-mask path above: depend on the snapshot's render
+                        // task so a snapshot-backed mask resolves same-frame.
+                        let snapshot_task_id = match data_stores.clip[clip_instance.handle].item.kind {
+                            ClipItemKind::Image { image, .. } => frame_state.image_dependencies.get(&image).copied(),
+                            _ => None,
+                        };
+
                         for tile in frame_state.clip_store.visible_mask_tiles(clip_instance) {
                             frame_state.rg_builder.add_dependency(
                                 clip_task_id,
                                 tile.task_id,
                             );
+                            if let Some(snapshot_task_id) = snapshot_task_id {
+                                frame_state.rg_builder.add_dependency(
+                                    tile.task_id,
+                                    snapshot_task_id,
+                                );
+                            }
                         }
 
                         frame_state.clip_store.clip_node_instances.push(clip_instance.clone());
