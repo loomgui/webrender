@@ -123,6 +123,7 @@ mod upload;
 pub(crate) mod init;
 
 use composite::LayerCompositorFrameState;
+use shade::{ColdSourcePrograms, FixedSourceProgram};
 
 pub use debug::DebugRenderer;
 pub use shade::{PendingShadersToPrecache, Shaders, SharedShaders};
@@ -2854,7 +2855,7 @@ impl Renderer {
             match scissor_rect {
                 // If updating only a dirty rect within a picture cache target, the
                 // clear must also be scissored to that dirty region.
-                Some(r) if self.clear_caches_with_quads => {
+                Some(r) if self.source_picture_clear_needed(target) => {
                     self.device.enable_depth(DepthFunction::Always);
                     // Save the draw call count so that our reftests don't get confused...
                     let old_draw_call_count = stats.total_draw_calls;
@@ -2966,8 +2967,7 @@ impl Renderer {
             self.device.set_scissor_rect(scissor_rect)
         }
 
-        if !alpha_batch_container.opaque_batches.is_empty()
-            && !self.debug_flags.contains(DebugFlags::DISABLE_OPAQUE_PASS) {
+        if source_batch_pass_enabled(alpha_batch_container, self.debug_flags, false) {
             let _gl = self.gpu_profiler.start_marker("opaque batches");
             let opaque_sampler = self.gpu_profiler.start_sampler(GPU_SAMPLER_TAG_OPAQUE);
             self.set_blend(false, framebuffer_kind);
@@ -3010,8 +3010,7 @@ impl Renderer {
             self.device.disable_depth();
         }
 
-        if !alpha_batch_container.alpha_batches.is_empty()
-            && !self.debug_flags.contains(DebugFlags::DISABLE_ALPHA_PASS) {
+        if source_batch_pass_enabled(alpha_batch_container, self.debug_flags, true) {
             let _gl = self.gpu_profiler.start_marker("alpha batches");
             let transparent_sampler = self.gpu_profiler.start_sampler(GPU_SAMPLER_TAG_TRANSPARENT);
             self.set_blend(true, framebuffer_kind);
@@ -3143,8 +3142,7 @@ impl Renderer {
         // On some Mali-T devices we have observed crashes in subsequent draw calls
         // immediately after clearing the alpha render target regions with glClear().
         // Using the shader to clear the regions avoids the crash. See bug 1638593.
-        let clear_with_quads = (target.cached && self.clear_caches_with_quads)
-            || (is_alpha && self.clear_alpha_targets_with_quads);
+        let clear_with_quads = self.source_clear_with_quads(target);
 
         let favor_partial_updates = self.device.get_capabilities().supports_render_target_partial_update
             && self.enable_clear_scissor;
@@ -3226,7 +3224,7 @@ impl Renderer {
 
         let mut clear_instances = Vec::with_capacity(target.clears.len());
         for (rect, color) in &target.clears {
-            if clear_with_quads || (!require_precise_clear && target.clear_color != Some(*color)) {
+            if source_clear_instance_needed(target, clear_with_quads, *color) {
                 let rect = rect.to_f32();
                 clear_instances.push(ClearInstance {
                     rect: [
@@ -3796,6 +3794,200 @@ impl Renderer {
         }
     }
 
+    fn source_clear_with_quads(&self, target: &RenderTarget) -> bool {
+        (target.cached && self.clear_caches_with_quads)
+            || (target.target_kind == RenderTargetKind::Alpha
+                && self.clear_alpha_targets_with_quads)
+    }
+    fn source_picture_clear_needed(&self, target: &PictureCacheTarget) -> bool {
+        let caps = self.device.get_capabilities();
+        caps.supports_render_target_partial_update
+            && (target.dirty_rect != target.valid_rect || caps.prefers_clear_scissor)
+            && self.clear_caches_with_quads
+    }
+    fn collect_source_batch_programs(
+        &self,
+        target: &AlphaBatchContainer,
+        shaders: &mut Shaders,
+        cold: &mut ColdSourcePrograms,
+    ) {
+        if source_batch_pass_enabled(target, self.debug_flags, false) {
+            for batch in target.opaque_batches.iter().rev() {
+                if should_skip_batch(&batch.key.kind, self.debug_flags) {
+                    continue;
+                }
+                let handle =
+                    shaders.get_handle(&batch.key, batch.features, self.debug_flags, &self.device);
+                shaders.consider_cold(cold, handle);
+            }
+        }
+        if source_batch_pass_enabled(target, self.debug_flags, true) {
+            for batch in &target.alpha_batches {
+                if should_skip_batch(&batch.key.kind, self.debug_flags) {
+                    continue;
+                }
+                let handle = shaders.get_handle(
+                    &batch.key,
+                    batch.features | BatchFeatures::ALPHA_PASS,
+                    self.debug_flags,
+                    &self.device,
+                );
+                shaders.consider_cold(cold, handle);
+            }
+        }
+    }
+    fn collect_source_clip_programs(
+        &self,
+        clips: &ClipBatchList,
+        shaders: &Shaders,
+        cold: &mut ColdSourcePrograms,
+    ) {
+        if self.debug_flags.contains(DebugFlags::DISABLE_CLIP_MASKS) {
+            return;
+        }
+        for (needed, kind) in [
+            (
+                !clips.slow_rectangles.is_empty(),
+                FixedSourceProgram::ClipSlow,
+            ),
+            (
+                !clips.fast_rectangles.is_empty(),
+                FixedSourceProgram::ClipFast,
+            ),
+        ] {
+            if needed {
+                shaders.consider_cold(cold, shaders.fixed_handle(kind));
+            }
+        }
+    }
+    fn collect_source_target_programs(
+        &self,
+        target: &RenderTarget,
+        shaders: &mut Shaders,
+        cold: &mut ColdSourcePrograms,
+    ) {
+        let clear_with_quads = self.source_clear_with_quads(target);
+        if target
+            .clears
+            .iter()
+            .any(|(_, color)| source_clear_instance_needed(target, clear_with_quads, *color))
+        {
+            shaders.consider_cold(cold, shaders.fixed_handle(FixedSourceProgram::Clear));
+        }
+        for (needed, kind) in [
+            (
+                !target.border_segments_solid.is_empty(),
+                FixedSourceProgram::BorderSolid,
+            ),
+            (
+                !target.border_segments_complex.is_empty(),
+                FixedSourceProgram::BorderSegment,
+            ),
+            (
+                !target.line_decorations.is_empty(),
+                FixedSourceProgram::Line,
+            ),
+            (
+                !target.vertical_blurs.is_empty() || !target.horizontal_blurs.is_empty(),
+                FixedSourceProgram::Blur,
+            ),
+        ] {
+            if needed {
+                shaders.consider_cold(cold, shaders.fixed_handle(kind));
+            }
+        }
+        // Iterate the ORIGINAL map in its draw order; no copied hash-map ordering.
+        for (source, _) in &target.scalings {
+            shaders.consider_cold(cold, shaders.scale_handle(source.image_buffer_kind()));
+        }
+        // SVG has its own disjoint handle and remains ordinary lazy initially.
+        for container in &target.alpha_batch_containers {
+            self.collect_source_batch_programs(container, shaders, cold);
+        }
+        for (index, instances) in target.prim_instances.iter().enumerate() {
+            if !instances.is_empty() {
+                shaders.consider_cold(
+                    cold,
+                    shaders.quad_handle(PatternKind::from_u32(index as u32)),
+                );
+            }
+        }
+        for ((_, pattern), _) in &target.prim_instances_with_scissor {
+            shaders.consider_cold(cold, shaders.quad_handle(*pattern));
+        }
+        self.collect_source_clip_programs(&target.clip_batcher.primary_clips, shaders, cold);
+        self.collect_source_clip_programs(&target.clip_batcher.secondary_clips, shaders, cold);
+        let masks = &target.clip_masks;
+        // Same six actual bind guards/order as handle_clips. Global dedup retains
+        // the first bind even when scissored/unscissored groups share a program.
+        for (needed, kind) in [
+            (
+                !masks.mask_instances_fast.is_empty(),
+                Some(FixedSourceProgram::MaskFast),
+            ),
+            (
+                !masks.mask_instances_fast_with_scissor.is_empty(),
+                Some(FixedSourceProgram::MaskFast),
+            ),
+            (!masks.image_mask_instances.is_empty(), None),
+            (!masks.image_mask_instances_with_scissor.is_empty(), None),
+            (
+                !masks.mask_instances_slow.is_empty(),
+                Some(FixedSourceProgram::Mask),
+            ),
+            (
+                !masks.mask_instances_slow_with_scissor.is_empty(),
+                Some(FixedSourceProgram::Mask),
+            ),
+        ] {
+            if needed {
+                let handle = kind
+                    .map(|k| shaders.fixed_handle(k))
+                    .unwrap_or_else(|| shaders.quad_handle(PatternKind::ColorOrTexture));
+                shaders.consider_cold(cold, handle);
+            }
+        }
+    }
+    fn collect_source_programs(&self, frame: &Frame) -> ColdSourcePrograms {
+        let mut cold = ColdSourcePrograms::new();
+        let mut shaders = self.shaders.borrow_mut();
+        for pass in &frame.passes {
+            if !frame.has_been_rendered {
+                for (_, target) in &pass.texture_cache {
+                    self.collect_source_target_programs(target, &mut shaders, &mut cold);
+                }
+                for target in &pass.picture_cache {
+                    if self.source_picture_clear_needed(target) {
+                        shaders.consider_cold(
+                            &mut cold,
+                            shaders.fixed_handle(FixedSourceProgram::Clear),
+                        );
+                    }
+                    if let PictureCacheTargetKind::Draw {
+                        ref alpha_batch_container,
+                    } = target.kind
+                    {
+                        self.collect_source_batch_programs(
+                            alpha_batch_container,
+                            &mut shaders,
+                            &mut cold,
+                        );
+                    }
+                }
+            }
+            for target in &pass.alpha.targets {
+                self.collect_source_target_programs(target, &mut shaders, &mut cold);
+            }
+            for target in &pass.color.targets {
+                self.collect_source_target_programs(target, &mut shaders, &mut cold);
+            }
+            if cold.rejected() {
+                break;
+            }
+        }
+        cold
+    }
+
     fn draw_frame(
         &mut self,
         frame: &mut Frame,
@@ -3813,6 +4005,29 @@ impl Renderer {
             frame.has_been_rendered = true;
             return;
         }
+
+        // Exact existing per-real-Frame first-draw signal, not mount/readiness.
+        // All-ready fresh Frames still scan metadata; reused Frames bypass it.
+        let _source_cohort =
+            if !frame.has_been_rendered && self.device.source_program_cohort_enabled() {
+                let scan_started = self
+                    .device
+                    .source_program_cohort_diagnostics_enabled()
+                    .then(std::time::Instant::now);
+                let cold = self.collect_source_programs(frame);
+                if let Some(started) = scan_started {
+                    report_source_cohort_scan(started.elapsed(), cold.len(), cold.rejected());
+                }
+                match Shaders::prepare_source_cohort(&self.shaders, cold, &mut self.device) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        self.renderer_errors.push(RendererError::from(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
 
         {
             let _gm = self.gpu_profiler.start_marker("gpu buffer update");
@@ -5107,6 +5322,40 @@ impl Renderer {
 enum FramebufferKind {
     Main,
     Other,
+}
+
+// Clock/TLS/output work remains inside the separately admitted diagnostic branch.
+// Report first8 and at most64 later >=10ms scans; omitted is as-of this row.
+fn report_source_cohort_scan(elapsed: std::time::Duration, cold: usize, rejected: bool) {
+    std::thread_local! {
+        static COUNTS: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+    }
+    let row = COUNTS.with(|counts| {
+        let (seen, slow, emitted) = counts.get();
+        let seen = seen.saturating_add(1);
+        let slow_row = seen > 8 && elapsed >= std::time::Duration::from_millis(10) && slow < 64;
+        let emit = seen <= 8 || slow_row;
+        let slow = slow + u64::from(slow_row);
+        let emitted = emitted + u64::from(emit);
+        counts.set((seen, slow, emitted));
+        emit.then_some((seen, emitted, seen - emitted))
+    });
+    if let Some((seen, emitted, omitted)) = row {
+        debug!(target: "webrender::device::gl",
+            "[PROGRAM-COHORT] scan observed={} emitted={} omitted={} cold={} rejected={} scan_ms={:.6}",
+            seen, emitted, omitted, cold, rejected, elapsed.as_secs_f64() * 1000.0);
+    }
+}
+
+fn source_batch_pass_enabled(target: &AlphaBatchContainer, flags: DebugFlags, alpha: bool) -> bool {
+    if alpha {
+        !target.alpha_batches.is_empty() && !flags.contains(DebugFlags::DISABLE_ALPHA_PASS)
+    } else {
+        !target.opaque_batches.is_empty() && !flags.contains(DebugFlags::DISABLE_OPAQUE_PASS)
+    }
+}
+fn source_clear_instance_needed(target: &RenderTarget, with_quads: bool, color: ColorF) -> bool {
+    with_quads || (!target.cached && target.clear_color != Some(color))
 }
 
 fn should_skip_batch(kind: &BatchKind, flags: DebugFlags) -> bool {
