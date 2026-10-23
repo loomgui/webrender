@@ -5,7 +5,7 @@
 use api::{ImageBufferKind, units::DeviceSize};
 use crate::batch::{BatchKey, BatchKind, BrushBatchKind, BatchFeatures};
 use crate::composite::{CompositeFeatures, CompositeSurfaceFormat};
-use crate::device::{Device, Program, ShaderError};
+use crate::device::{Device, Program, ShaderError, SourceProgramRequest, VertexDescriptor};
 use crate::pattern::PatternKind;
 use crate::telemetry::Telemetry;
 use euclid::default::Transform3D;
@@ -80,6 +80,145 @@ pub(crate) enum ShaderKind {
     Composite,
     Clear,
     Copy,
+}
+
+const SOURCE_COHORT_LIMIT: usize = 16;
+
+// Fixed storage: ready-only new frames and <2 cold candidates allocate nothing.
+pub(super) struct ColdSourcePrograms {
+    handles: [Option<ShaderHandle>; SOURCE_COHORT_LIMIT],
+    len: usize,
+    rejected: bool,
+}
+impl ColdSourcePrograms {
+    pub(super) fn new() -> Self {
+        Self {
+            handles: [None; SOURCE_COHORT_LIMIT],
+            len: 0,
+            rejected: false,
+        }
+    }
+    fn push(&mut self, handle: ShaderHandle) {
+        if self.handles[..self.len].contains(&Some(handle)) {
+            return;
+        }
+        if self.len == SOURCE_COHORT_LIMIT {
+            self.rejected = true;
+            return;
+        }
+        self.handles[self.len] = Some(handle);
+        self.len += 1;
+    }
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+    pub(super) fn rejected(&self) -> bool {
+        self.rejected
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum FixedSourceProgram {
+    Blur,
+    BorderSolid,
+    BorderSegment,
+    Line,
+    ClipSlow,
+    ClipFast,
+    Clear,
+    Mask,
+    MaskFast,
+}
+
+fn source_vertex_descriptor(kind: &ShaderKind) -> &'static VertexDescriptor {
+    let format = match kind {
+        ShaderKind::Primitive | ShaderKind::Brush | ShaderKind::Text => VertexArrayKind::Primitive,
+        ShaderKind::Cache(format) | ShaderKind::ClipCache(format) => *format,
+        ShaderKind::Composite => VertexArrayKind::Composite,
+        ShaderKind::Clear => VertexArrayKind::Clear,
+        ShaderKind::Copy => VertexArrayKind::Copy,
+    };
+    match format {
+        VertexArrayKind::Primitive => &desc::PRIM_INSTANCES,
+        VertexArrayKind::LineDecoration => &desc::LINE,
+        VertexArrayKind::Blur => &desc::BLUR,
+        VertexArrayKind::ClipRect => &desc::CLIP_RECT,
+        VertexArrayKind::Border => &desc::BORDER,
+        VertexArrayKind::Scale => &desc::SCALE,
+        VertexArrayKind::SvgFilterNode => &desc::SVG_FILTER_NODE,
+        VertexArrayKind::Composite => &desc::COMPOSITE,
+        VertexArrayKind::Clear => &desc::CLEAR,
+        VertexArrayKind::Copy => &desc::COPY,
+        VertexArrayKind::Mask => &desc::MASK,
+    }
+}
+
+// Owns only source-cohort lazy slots, not a Renderer/Device borrow. On any
+// return/unwind, extract unfinished resources under RefCell, then delete GL
+// objects after dropping that borrow, on this same !Send owner/context.
+pub(super) struct SourceProgramCohort {
+    shaders: SharedShaders,
+    handles: ColdSourcePrograms,
+    diagnostics: bool,
+}
+impl Drop for SourceProgramCohort {
+    fn drop(&mut self) {
+        let mut abandoned: [Option<Program>; SOURCE_COHORT_LIMIT] = std::array::from_fn(|_| None);
+        let mut finished = 0;
+        {
+            let mut shaders = self.shaders.borrow_mut();
+            for (i, handle) in self.handles.handles[..self.handles.len].iter().enumerate() {
+                let shader = shaders.loader.get(handle.unwrap());
+                if shader
+                    .program
+                    .as_ref()
+                    .is_some_and(Program::belongs_to_source_cohort)
+                {
+                    abandoned[i] = shader.program.take();
+                } else if shader.program.as_ref().is_some_and(Program::is_initialized) {
+                    finished += 1;
+                }
+            }
+        }
+        drop(abandoned);
+        if !self.diagnostics {
+            return;
+        }
+        // One bounded, source-backed observation after owned cleanup and RefMut.
+        // This is not a native-frame validity signal; its timestamp is only context.
+        std::thread_local! {
+            static ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        let ordinal = ROWS.with(|rows| {
+            let n = rows.get().saturating_add(1);
+            rows.set(n);
+            n
+        });
+        if ordinal <= 64 {
+            debug!(target: "webrender::device::gl",
+                "[PROGRAM-COHORT] outcome ordinal={} submitted={} finished={} abandoned_or_failed={}",
+                ordinal, self.handles.len, finished, self.handles.len - finished);
+        }
+    }
+}
+
+// All owners stay in a caller-owned vector declared before the Shaders borrow.
+// Validate the complete fixed destination table before any ownership transfer;
+// the publication loop then has no indexing, assertions, allocation or callbacks.
+fn publish_source_program_slots<P>(
+    destinations: &mut [Option<&mut Option<P>>],
+    programs: &mut [Option<P>],
+) {
+    assert_eq!(destinations.len(), programs.len());
+    assert!(destinations
+        .iter()
+        .all(|slot| slot.as_ref().is_some_and(|slot| slot.is_none())));
+    assert!(programs.iter().all(Option::is_some));
+    for (destination, program) in destinations.iter_mut().zip(programs.iter_mut()) {
+        if let Some(slot) = destination {
+            **slot = program.take();
+        }
+    }
 }
 
 pub struct LazilyCompiledShader {
@@ -224,30 +363,7 @@ impl LazilyCompiledShader {
         if precache_flags.contains(ShaderPrecacheFlags::FULL_COMPILE) && !program.is_initialized() {
             let start_time = zeitstempel::now();
 
-            let vertex_format = match self.kind {
-                ShaderKind::Primitive |
-                ShaderKind::Brush |
-                ShaderKind::Text => VertexArrayKind::Primitive,
-                ShaderKind::Cache(format) => format,
-                ShaderKind::ClipCache(format) => format,
-                ShaderKind::Composite => VertexArrayKind::Composite,
-                ShaderKind::Clear => VertexArrayKind::Clear,
-                ShaderKind::Copy => VertexArrayKind::Copy,
-            };
-
-            let vertex_descriptor = match vertex_format {
-                VertexArrayKind::Primitive => &desc::PRIM_INSTANCES,
-                VertexArrayKind::LineDecoration => &desc::LINE,
-                VertexArrayKind::Blur => &desc::BLUR,
-                VertexArrayKind::ClipRect => &desc::CLIP_RECT,
-                VertexArrayKind::Border => &desc::BORDER,
-                VertexArrayKind::Scale => &desc::SCALE,
-                VertexArrayKind::SvgFilterNode => &desc::SVG_FILTER_NODE,
-                VertexArrayKind::Composite => &desc::COMPOSITE,
-                VertexArrayKind::Clear => &desc::CLEAR,
-                VertexArrayKind::Copy => &desc::COPY,
-                VertexArrayKind::Mask => &desc::MASK,
-            };
+            let vertex_descriptor = source_vertex_descriptor(&self.kind);
 
             device.link_program(program, vertex_descriptor)?;
             device.bind_program(program);
@@ -1101,21 +1217,23 @@ impl Shaders {
         self.loader.get(shader_handle)
     }
 
+    pub(super) fn scale_handle(&self, buffer_kind: ImageBufferKind) -> ShaderHandle {
+        let shader_index = Self::get_compositing_shader_index(buffer_kind);
+        let shader_handle =
+            self.cs_scale[shader_index].expect("bug: unsupported scale shader requested");
+        shader_handle
+    }
+
     pub fn get_scale_shader(
         &mut self,
         buffer_kind: ImageBufferKind,
     ) -> &mut LazilyCompiledShader {
-        let shader_index = Self::get_compositing_shader_index(buffer_kind);
-        let shader_handle = self.cs_scale[shader_index]
-            .expect("bug: unsupported scale shader requested");
+        let shader_handle = self.scale_handle(buffer_kind);
         self.loader.get(shader_handle)
     }
 
-    pub fn get_quad_shader(
-        &mut self,
-        pattern: PatternKind,
-    ) -> &mut LazilyCompiledShader {
-        let shader_handle = match pattern {
+    pub(super) fn quad_handle(&self, pattern: PatternKind) -> ShaderHandle {
+        match pattern {
             PatternKind::ColorOrTexture => self.ps_quad_textured,
             PatternKind::TextureExternal => self.ps_quad_textured_external
                 .expect("bug: ps_quad_textured TEXTURE_EXTERNAL variant not loaded"),
@@ -1127,7 +1245,11 @@ impl Shaders {
             PatternKind::Repeat => self.ps_quad_repeat,
             PatternKind::BoxShadow => self.ps_quad_box_shadow,
             PatternKind::Mask => unreachable!(),
-        };
+        }
+    }
+
+    pub fn get_quad_shader(&mut self, pattern: PatternKind) -> &mut LazilyCompiledShader {
+        let shader_handle = self.quad_handle(pattern);
         self.loader.get(shader_handle)
     }
 
@@ -1237,19 +1359,93 @@ impl Shaders {
         }
     }
 
-    pub fn cs_blur_rgba8(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.cs_blur_rgba8) }
-    pub fn cs_border_segment(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.cs_border_segment) }
-    pub fn cs_border_solid(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.cs_border_solid) }
-    pub fn cs_line_decoration(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.cs_line_decoration) }
+    pub(super) fn fixed_handle(&self, kind: FixedSourceProgram) -> ShaderHandle {
+        match kind {
+            FixedSourceProgram::Blur => self.cs_blur_rgba8,
+            FixedSourceProgram::BorderSolid => self.cs_border_solid,
+            FixedSourceProgram::BorderSegment => self.cs_border_segment,
+            FixedSourceProgram::Line => self.cs_line_decoration,
+            FixedSourceProgram::ClipSlow => self.cs_clip_rectangle_slow,
+            FixedSourceProgram::ClipFast => self.cs_clip_rectangle_fast,
+            FixedSourceProgram::Clear => self.ps_clear,
+            FixedSourceProgram::Mask => self.ps_mask,
+            FixedSourceProgram::MaskFast => self.ps_mask_fast,
+        }
+    }
+    pub(super) fn consider_cold(&self, list: &mut ColdSourcePrograms, handle: ShaderHandle) {
+        // Existing ready or externally-precreated state stays on its exact path.
+        if self.loader.shaders[handle.0].program.is_none() {
+            list.push(handle);
+        }
+    }
+    pub(super) fn prepare_source_cohort(
+        shared: &SharedShaders,
+        handles: ColdSourcePrograms,
+        device: &mut Device,
+    ) -> Result<Option<SourceProgramCohort>, ShaderError> {
+        if handles.rejected || handles.len < 2 {
+            return Ok(None);
+        }
+        let requests = {
+            let shaders = shared.borrow();
+            handles.handles[..handles.len]
+                .iter()
+                .map(|h| {
+                    let shader = &shaders.loader.shaders[h.unwrap().0];
+                    assert!(shader.program.is_none());
+                    SourceProgramRequest {
+                        name: shader.name,
+                        features: shader.features.clone(),
+                        descriptor: source_vertex_descriptor(&shader.kind),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        // No Shaders/ProgramCache borrow spans driver or embedder hooks.
+        let Some(programs) = device.prepare_source_program_cohort(&requests)? else {
+            return Ok(None);
+        };
+        // Conversion/allocation and all owning iterator drops precede RefMut.
+        let mut programs: Vec<_> = programs
+            .into_iter()
+            .map(|program| Some(program.into_program()))
+            .collect();
+        {
+            let mut shaders = shared.borrow_mut();
+            let mut destinations: [Option<&mut Option<Program>>; SOURCE_COHORT_LIMIT] =
+                std::array::from_fn(|_| None);
+            for (index, shader) in shaders.loader.shaders.iter_mut().enumerate() {
+                if let Some(position) = handles.handles[..handles.len]
+                    .iter()
+                    .position(|handle| *handle == Some(ShaderHandle(index)))
+                {
+                    destinations[position] = Some(&mut shader.program);
+                }
+            }
+            publish_source_program_slots(&mut destinations[..handles.len], &mut programs);
+        }
+        // Publication is complete; no driver/callback/fallible work separates it
+        // from constructing the owner guard, and no Shaders borrow survives here.
+        Ok(Some(SourceProgramCohort {
+            shaders: shared.clone(),
+            handles,
+            diagnostics: device.source_program_cohort_diagnostics_enabled(),
+        }))
+    }
+
+    pub fn cs_blur_rgba8(&mut self) -> &mut LazilyCompiledShader { let handle = self.fixed_handle(FixedSourceProgram::Blur); self.loader.get(handle) }
+    pub fn cs_border_segment(&mut self) -> &mut LazilyCompiledShader { let handle = self.fixed_handle(FixedSourceProgram::BorderSegment); self.loader.get(handle) }
+    pub fn cs_border_solid(&mut self) -> &mut LazilyCompiledShader { let handle = self.fixed_handle(FixedSourceProgram::BorderSolid); self.loader.get(handle) }
+    pub fn cs_line_decoration(&mut self) -> &mut LazilyCompiledShader { let handle = self.fixed_handle(FixedSourceProgram::Line); self.loader.get(handle) }
     pub fn cs_svg_filter_node(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.cs_svg_filter_node) }
-    pub fn cs_clip_rectangle_slow(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.cs_clip_rectangle_slow) }
-    pub fn cs_clip_rectangle_fast(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.cs_clip_rectangle_fast) }
+    pub fn cs_clip_rectangle_slow(&mut self) -> &mut LazilyCompiledShader { let handle = self.fixed_handle(FixedSourceProgram::ClipSlow); self.loader.get(handle) }
+    pub fn cs_clip_rectangle_fast(&mut self) -> &mut LazilyCompiledShader { let handle = self.fixed_handle(FixedSourceProgram::ClipFast); self.loader.get(handle) }
     pub fn ps_quad_textured(&mut self) -> &mut LazilyCompiledShader {
         self.loader.get(self.ps_quad_textured)
     }
-    pub fn ps_mask(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.ps_mask) }
-    pub fn ps_mask_fast(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.ps_mask_fast) }
-    pub fn ps_clear(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.ps_clear) }
+    pub fn ps_mask(&mut self) -> &mut LazilyCompiledShader { let handle = self.fixed_handle(FixedSourceProgram::Mask); self.loader.get(handle) }
+    pub fn ps_mask_fast(&mut self) -> &mut LazilyCompiledShader { let handle = self.fixed_handle(FixedSourceProgram::MaskFast); self.loader.get(handle) }
+    pub fn ps_clear(&mut self) -> &mut LazilyCompiledShader { let handle = self.fixed_handle(FixedSourceProgram::Clear); self.loader.get(handle) }
     pub fn ps_copy(&mut self) -> &mut LazilyCompiledShader { self.loader.get(self.ps_copy) }
 
     pub fn deinit(self, device: &mut Device) {
@@ -1437,5 +1633,108 @@ fn get_shader_feature_flags(
             }
             flags
         }
+    }
+}
+
+#[cfg(test)]
+mod source_program_cohort_tests {
+    use super::*;
+    #[test]
+    fn source_slot_publication_validates_before_moves_and_releases_borrow_before_owner_cleanup() {
+        use std::cell::Cell;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        struct Owner {
+            id: usize,
+            slots: std::rc::Weak<RefCell<Vec<Option<Owner>>>>,
+            drops: Rc<Cell<usize>>,
+            drops_while_borrowed: Rc<Cell<usize>>,
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+                if self
+                    .slots
+                    .upgrade()
+                    .is_some_and(|slots| slots.try_borrow_mut().is_err())
+                {
+                    self.drops_while_borrowed
+                        .set(self.drops_while_borrowed.get() + 1);
+                }
+            }
+        }
+        for mode in 0..3 {
+            // occupied destination, missing destination, successful ordered publication
+            let slots = Rc::new(RefCell::new(vec![None, None]));
+            let drops = Rc::new(Cell::new(0));
+            let bad_drops = Rc::new(Cell::new(0));
+            let owner = |id| Owner {
+                id,
+                slots: Rc::downgrade(&slots),
+                drops: drops.clone(),
+                drops_while_borrowed: bad_drops.clone(),
+            };
+            if mode == 0 {
+                slots.borrow_mut()[1] = Some(owner(99));
+            }
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let mut programs = vec![Some(owner(10)), Some(owner(20))];
+                let mut borrowed = slots.borrow_mut();
+                let (first, second) = borrowed.split_at_mut(1);
+                let mut destinations = [
+                    Some(&mut first[0]),
+                    if mode == 1 {
+                        None
+                    } else {
+                        Some(&mut second[0])
+                    },
+                ];
+                publish_source_program_slots(&mut destinations, &mut programs);
+                assert!(programs.iter().all(Option::is_none));
+            }));
+            assert_eq!(outcome.is_ok(), mode == 2);
+            assert_eq!(
+                bad_drops.get(),
+                0,
+                "owner cleanup ran under the Shaders borrow"
+            );
+            if mode == 2 {
+                assert_eq!(
+                    slots
+                        .borrow()
+                        .iter()
+                        .map(|slot| slot.as_ref().unwrap().id)
+                        .collect::<Vec<_>>(),
+                    vec![10, 20]
+                );
+                assert_eq!(drops.get(), 0);
+            } else {
+                assert!(
+                    slots.borrow()[0].is_none(),
+                    "invalid table partially published an owner"
+                );
+                assert_eq!(drops.get(), 2);
+            }
+            let remaining = std::mem::take(&mut *slots.borrow_mut());
+            drop(remaining);
+            assert_eq!(drops.get(), if mode == 0 { 3 } else { 2 });
+            assert_eq!(bad_drops.get(), 0);
+        }
+    }
+
+    #[test]
+    fn cold_source_list_preserves_first_use_deduplicates_and_rejects_overflow() {
+        let mut cold = ColdSourcePrograms::new();
+        for i in (0..SOURCE_COHORT_LIMIT).rev() {
+            cold.push(ShaderHandle(i));
+            cold.push(ShaderHandle(i));
+        }
+        assert_eq!(cold.len(), SOURCE_COHORT_LIMIT);
+        assert!(!cold.rejected());
+        assert_eq!(cold.handles[0], Some(ShaderHandle(SOURCE_COHORT_LIMIT - 1)));
+        assert_eq!(cold.handles[SOURCE_COHORT_LIMIT - 1], Some(ShaderHandle(0)));
+        cold.push(ShaderHandle(SOURCE_COHORT_LIMIT));
+        assert!(cold.rejected());
+        assert_eq!(cold.len(), SOURCE_COHORT_LIMIT);
+        assert_eq!(cold.handles[0], Some(ShaderHandle(SOURCE_COHORT_LIMIT - 1)));
     }
 }

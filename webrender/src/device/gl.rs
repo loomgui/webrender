@@ -637,22 +637,396 @@ impl Drop for Texture {
     }
 }
 
+// Small cache-operation seam; production delegates directly to the owning GL.
+// Tests fake only these calls, never Device, rendering or shader source.
+trait CacheGlOps {
+    fn error(&self) -> gl::GLenum;
+    fn binary(&self, program: gl::GLuint, format: gl::GLenum, bytes: &[u8]);
+    fn status(&self, program: gl::GLuint) -> gl::GLint;
+    fn info_log(&self, program: gl::GLuint) -> String;
+    fn delete(&self, program: gl::GLuint);
+}
+struct CacheGl<'a>(&'a dyn gl::Gl);
+impl CacheGlOps for CacheGl<'_> {
+    fn error(&self) -> gl::GLenum {
+        self.0.get_error()
+    }
+    fn binary(&self, p: gl::GLuint, f: gl::GLenum, b: &[u8]) {
+        self.0.program_binary(p, f, b);
+    }
+    fn status(&self, p: gl::GLuint) -> gl::GLint {
+        let mut status = [0];
+        unsafe {
+            self.0.get_program_iv(p, gl::LINK_STATUS, &mut status);
+        }
+        status[0]
+    }
+    fn info_log(&self, p: gl::GLuint) -> String {
+        self.0.get_program_info_log(p)
+    }
+    fn delete(&self, p: gl::GLuint) {
+        self.0.delete_program(p);
+    }
+}
+#[derive(Debug, PartialEq)]
+struct CacheGlFailure {
+    phase: &'static str,
+    error: gl::GLenum,
+}
+#[derive(Debug, PartialEq)]
+enum CacheLink {
+    Linked,
+    Rejected(String),
+}
+fn cache_gl_clear(ops: &impl CacheGlOps, phase: &'static str) -> Result<(), CacheGlFailure> {
+    let error = ops.error();
+    if error == gl::NO_ERROR {
+        Ok(())
+    } else {
+        Err(CacheGlFailure { phase, error })
+    }
+}
+fn submit_cache_binary(
+    ops: &impl CacheGlOps,
+    p: gl::GLuint,
+    f: gl::GLenum,
+    b: &[u8],
+) -> Result<(), CacheGlFailure> {
+    cache_gl_clear(ops, "before binary submission")?;
+    ops.binary(p, f, b);
+    cache_gl_clear(ops, "after binary submission")
+}
+fn inspect_cache_binary(ops: &impl CacheGlOps, p: gl::GLuint) -> Result<CacheLink, CacheGlFailure> {
+    cache_gl_clear(ops, "before binary status query")?;
+    let status = ops.status(p);
+    cache_gl_clear(ops, "after binary status query")?;
+    if status != 0 {
+        return Ok(CacheLink::Linked);
+    }
+    let log = ops.info_log(p);
+    cache_gl_clear(ops, "after binary info-log query")?;
+    Ok(CacheLink::Rejected(log))
+}
+fn reject_cache_binary(
+    cache: &ProgramCache,
+    digest: &ProgramSourceDigest,
+    binary: &Arc<ProgramBinary>,
+) {
+    cache.entries.borrow_mut().remove(digest);
+    // The statement above ended the RefMut. Callback may safely reenter cache.
+    if let Some(ref handler) = cache.program_cache_handler {
+        handler.notify_program_binary_failed(binary);
+    }
+}
+fn discard_program(ops: &impl CacheGlOps, program: &mut Program) {
+    if program.id != 0 {
+        ops.delete(program.id);
+        program.id = 0;
+    }
+}
+fn finish_created_program(
+    ops: &impl CacheGlOps,
+    mut program: Program,
+    result: Result<(), ShaderError>,
+) -> Result<Program, ShaderError> {
+    match result {
+        Ok(()) => Ok(program),
+        Err(error) => {
+            discard_program(ops, &mut program);
+            Err(error)
+        }
+    }
+}
+
+// Diagnostic evidence remains an explicit opt-in, separate from production use.
+fn source_program_cohort_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LOOM_REQUIRED_PROGRAM_COHORT").as_deref() == Ok("1")
+            && std::env::var("LOOM_PACING_ORACLE").as_deref() == Ok("1")
+            && matches!(
+                std::env::var("LOOM_PACING_PROFILE").as_deref(),
+                Ok("app"
+                    | "oracle-retained-backgrounds"
+                    | "oracle-selected-highlight"
+                    | "oracle-certified-backgrounds")
+            )
+    })
+}
+
+// The Windows host uses ANGLE's D3D11 hardware producer for both Unity D3D
+// consumers. Other platforms/backends retain the previous diagnostic opt-in.
+fn source_program_cohort_admitted(windows: bool, renderer: &str, explicit: Option<bool>) -> bool {
+    explicit.unwrap_or_else(|| {
+        windows && renderer.starts_with("ANGLE (") && renderer.contains(" Direct3D11 ")
+    })
+}
+
+fn source_program_cohort_override() -> Option<bool> {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("LOOM_REQUIRED_PROGRAM_COHORT") {
+        // Unset is the production policy. Explicit zero keeps same-binary serial
+        // controls; explicit one preserves the old diagnostic-only opt-in.
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(value) if value == "1" => Some(source_program_cohort_diagnostics_enabled()),
+        _ => Some(false),
+    })
+}
+
+pub(crate) struct SourceProgramRequest {
+    pub name: &'static str,
+    pub features: Vec<&'static str>,
+    pub descriptor: &'static VertexDescriptor,
+}
+
+// Only this small production operation seam is faked by the ownership/order tests.
+// Rc makes the submitted resources !Send, as is the existing Renderer owner.
+trait SourceLinkOps {
+    fn create_shader(&self, kind: gl::GLenum) -> gl::GLuint;
+    fn source(&self, shader: gl::GLuint, source: &str);
+    fn compile(&self, shader: gl::GLuint);
+    fn attach(&self, program: gl::GLuint, shader: gl::GLuint);
+    fn detach(&self, program: gl::GLuint, shader: gl::GLuint);
+    fn attribute(&self, program: gl::GLuint, index: u32, name: &str);
+    fn link(&self, program: gl::GLuint);
+    fn shader_log(&self, shader: gl::GLuint) -> String;
+    fn shader_status(&self, shader: gl::GLuint) -> gl::GLint;
+    fn program_log(&self, program: gl::GLuint) -> String;
+    fn program_status(&self, program: gl::GLuint) -> gl::GLint;
+    fn delete_shader(&self, shader: gl::GLuint);
+    fn delete_program(&self, program: gl::GLuint);
+}
+struct SourceLinkGl {
+    gl: Rc<dyn gl::Gl>,
+    null_terminated: bool,
+}
+impl SourceLinkOps for SourceLinkGl {
+    fn create_shader(&self, kind: gl::GLenum) -> gl::GLuint {
+        self.gl.create_shader(kind)
+    }
+    fn source(&self, shader: gl::GLuint, source: &str) {
+        let mut source = Cow::from(source);
+        if self.null_terminated {
+            source.to_mut().push('\0');
+        }
+        self.gl.shader_source(shader, &[source.as_bytes()]);
+    }
+    fn compile(&self, shader: gl::GLuint) {
+        self.gl.compile_shader(shader);
+    }
+    fn attach(&self, p: gl::GLuint, s: gl::GLuint) {
+        self.gl.attach_shader(p, s);
+    }
+    fn detach(&self, p: gl::GLuint, s: gl::GLuint) {
+        self.gl.detach_shader(p, s);
+    }
+    fn attribute(&self, p: gl::GLuint, i: u32, n: &str) {
+        self.gl.bind_attrib_location(p, i, n);
+    }
+    fn link(&self, p: gl::GLuint) {
+        self.gl.link_program(p);
+    }
+    fn shader_log(&self, s: gl::GLuint) -> String {
+        self.gl.get_shader_info_log(s)
+    }
+    fn shader_status(&self, s: gl::GLuint) -> gl::GLint {
+        let mut status = [0];
+        unsafe {
+            self.gl.get_shader_iv(s, gl::COMPILE_STATUS, &mut status);
+        }
+        status[0]
+    }
+    fn program_log(&self, p: gl::GLuint) -> String {
+        self.gl.get_program_info_log(p)
+    }
+    fn program_status(&self, p: gl::GLuint) -> gl::GLint {
+        let mut status = [0];
+        unsafe {
+            self.gl.get_program_iv(p, gl::LINK_STATUS, &mut status);
+        }
+        status[0]
+    }
+    fn delete_shader(&self, s: gl::GLuint) {
+        self.gl.delete_shader(s);
+    }
+    fn delete_program(&self, p: gl::GLuint) {
+        self.gl.delete_program(p);
+    }
+}
+
+struct PendingSourceLink {
+    ops: Rc<dyn SourceLinkOps>,
+    program: gl::GLuint,
+    vs: gl::GLuint,
+    fs: gl::GLuint,
+    vs_attached: bool,
+    fs_attached: bool,
+    name: String,
+    base_name: &'static str,
+    vs_source: String,
+    fs_source: String,
+}
+impl PendingSourceLink {
+    // Own the program BEFORE source preparation/submission can unwind.
+    fn new(ops: Rc<dyn SourceLinkOps>, program: gl::GLuint, info: &ProgramSourceInfo) -> Self {
+        let mut pending = Self {
+            ops,
+            program,
+            vs: 0,
+            fs: 0,
+            vs_attached: false,
+            fs_attached: false,
+            name: String::new(),
+            base_name: info.base_filename,
+            vs_source: String::new(),
+            fs_source: String::new(),
+        };
+        pending.name = info.full_name();
+        pending
+    }
+    fn submit(&mut self, descriptor: &VertexDescriptor) {
+        debug!("compile {}", self.name);
+        self.vs = self.ops.create_shader(gl::VERTEX_SHADER);
+        self.ops.source(self.vs, &self.vs_source);
+        self.ops.compile(self.vs);
+        debug!("compile {}", self.name);
+        self.fs = self.ops.create_shader(gl::FRAGMENT_SHADER);
+        self.ops.source(self.fs, &self.fs_source);
+        self.ops.compile(self.fs);
+        self.ops.attach(self.program, self.vs);
+        self.vs_attached = true;
+        self.ops.attach(self.program, self.fs);
+        self.fs_attached = true;
+        for (i, attr) in descriptor
+            .vertex_attributes
+            .iter()
+            .chain(descriptor.instance_attributes.iter())
+            .enumerate()
+        {
+            self.ops.attribute(self.program, i as u32, attr.name);
+        }
+        // CacheNone is an admission invariant: no binary-retrievable hint/import.
+        self.ops.link(self.program);
+    }
+    fn check_shader(
+        &self,
+        shader: gl::GLuint,
+        kind: gl::GLenum,
+        _source: &str,
+    ) -> Result<(), ShaderError> {
+        let log = self.ops.shader_log(shader);
+        if self.ops.shader_status(shader) == 0 {
+            let type_str = if kind == gl::VERTEX_SHADER {
+                "vertex"
+            } else {
+                "fragment"
+            };
+            error!(
+                "Failed to compile {} shader: {}\n{}",
+                type_str, self.name, log
+            );
+            #[cfg(debug_assertions)]
+            Device::print_shader_errors(_source, &log);
+            return Err(ShaderError::Compilation(self.name.clone(), log));
+        }
+        if !log.is_empty() {
+            warn!("Warnings detected on shader: {}\n{}", self.name, log);
+        }
+        Ok(())
+    }
+    fn release_shaders(&mut self) {
+        if self.vs_attached {
+            self.ops.detach(self.program, self.vs);
+            self.vs_attached = false;
+        }
+        if self.fs_attached {
+            self.ops.detach(self.program, self.fs);
+            self.fs_attached = false;
+        }
+        if self.vs != 0 {
+            self.ops.delete_shader(self.vs);
+            self.vs = 0;
+        }
+        if self.fs != 0 {
+            self.ops.delete_shader(self.fs);
+            self.fs = 0;
+        }
+    }
+    fn finish(mut self) -> Result<gl::GLuint, ShaderError> {
+        // These waits occur only at the original ordinary bind site, in the
+        // original VS-info/status, FS-info/status, link-status order.
+        self.check_shader(self.vs, gl::VERTEX_SHADER, &self.vs_source)?;
+        self.check_shader(self.fs, gl::FRAGMENT_SHADER, &self.fs_source)?;
+        self.release_shaders();
+        if self.ops.program_status(self.program) == 0 {
+            let log = self.ops.program_log(self.program);
+            error!("Failed to link shader program: {}\n{}", self.base_name, log);
+            return Err(ShaderError::Link(self.base_name.to_owned(), log));
+        }
+        // The containing Program regains ownership only after validation.
+        Ok(mem::replace(&mut self.program, 0))
+    }
+}
+impl Drop for PendingSourceLink {
+    fn drop(&mut self) {
+        self.release_shaders();
+        if self.program != 0 {
+            self.ops.delete_program(self.program);
+            self.program = 0;
+        }
+    }
+}
+
+pub(crate) struct OwnedSourceProgram(Option<Program>);
+impl OwnedSourceProgram {
+    pub(crate) fn into_program(mut self) -> Program {
+        self.0.take().unwrap()
+    }
+}
+
+fn submit_source_programs(programs: &mut [OwnedSourceProgram], requests: &[SourceProgramRequest]) {
+    assert_eq!(programs.len(), requests.len());
+    for (program, request) in programs.iter_mut().zip(requests) {
+        program
+            .0
+            .as_mut()
+            .unwrap()
+            .pending_source
+            .as_mut()
+            .unwrap()
+            .submit(request.descriptor);
+    }
+}
+
 pub struct Program {
     id: gl::GLuint,
     u_transform: gl::GLint,
     u_texture_size: gl::GLint,
     source_info: ProgramSourceInfo,
     is_initialized: bool,
+    pending_source: Option<PendingSourceLink>,
+    cohort_error: Option<ShaderError>,
+    source_cleanup: Option<Rc<dyn SourceLinkOps>>,
 }
 
 impl Program {
     pub fn is_initialized(&self) -> bool {
         self.is_initialized
     }
+    pub(crate) fn belongs_to_source_cohort(&self) -> bool {
+        self.source_cleanup.is_some()
+    }
 }
 
 impl Drop for Program {
     fn drop(&mut self) {
+        if let Some(ops) = self.source_cleanup.take() {
+            drop(self.pending_source.take());
+            if self.id != 0 {
+                ops.delete_program(self.id);
+                self.id = 0;
+            }
+        }
         debug_assert!(
             thread::panicking() || self.id == 0,
             "renderer::deinit not called"
@@ -1209,6 +1583,7 @@ pub struct Device {
 
     max_texture_size: i32,
     cached_programs: Option<Rc<ProgramCache>>,
+    source_program_cohort_supported: bool,
 
     // Frame counter. This is used to map between CPU
     // frames and GPU frames.
@@ -1990,6 +2365,14 @@ impl Device {
         // an attached buffer has been orphaned.
         let requires_vao_rebind_after_orphaning = is_adreno_3xx;
 
+        let source_program_cohort_supported = source_program_cohort_admitted(
+            cfg!(target_os = "windows"),
+            &renderer_name,
+            source_program_cohort_override(),
+        ) && gl.get_type() == gl::GlType::Gles
+            && gl_version >= [3, 0]
+            && !is_software_webrender
+            && supports_extension(&extensions, "GL_KHR_parallel_shader_compile");
         Device {
             gl,
             base_gl: None,
@@ -2054,6 +2437,7 @@ impl Device {
 
             max_texture_size,
             cached_programs,
+            source_program_cohort_supported,
             frame_id: GpuFrameId(0),
             extensions,
             texture_storage_usage,
@@ -2214,6 +2598,67 @@ impl Device {
         for (line, prefix) in source.lines().skip(base_line_number).zip(&["|",">","|"]) {
             error!("{}\t{}", prefix, line);
         }
+    }
+
+    fn cache_shader_error(&self, shader: &str, error: CacheGlFailure) -> ShaderError {
+        let message = format!(
+            "FATAL GL error 0x{:x} {} for cached program {}",
+            error.error, error.phase, shader
+        );
+        error!("{}", message);
+        ShaderError::Link(shader.to_owned(), message)
+    }
+
+    pub(crate) fn source_program_cohort_diagnostics_enabled(&self) -> bool {
+        source_program_cohort_diagnostics_enabled()
+    }
+
+    pub(crate) fn source_program_cohort_enabled(&self) -> bool {
+        self.source_program_cohort_supported
+            && self.cached_programs.is_none()
+            && self.resource_override_path.is_none()
+            && self.dump_shader_source.is_none()
+    }
+
+    pub(crate) fn prepare_source_program_cohort(
+        &mut self,
+        requests: &[SourceProgramRequest],
+    ) -> Result<Option<Vec<OwnedSourceProgram>>, ShaderError> {
+        assert!(self.source_program_cohort_enabled());
+        assert!((2..=16).contains(&requests.len()));
+        let ops: Rc<dyn SourceLinkOps> = Rc::new(SourceLinkGl {
+            gl: self.gl.clone(),
+            null_terminated: self.requires_null_terminated_shader_source,
+        });
+        let mut programs = Vec::with_capacity(requests.len());
+        let mut source_bytes = 0usize;
+        for request in requests {
+            let mut program = self.create_program(request.name, &request.features)?;
+            program.source_cleanup = Some(ops.clone());
+            let mut owned = OwnedSourceProgram(Some(program));
+            let program = owned.0.as_mut().unwrap();
+            let mut pending = PendingSourceLink::new(
+                ops.clone(),
+                mem::replace(&mut program.id, 0),
+                &program.source_info,
+            );
+            pending.vs_source = program.source_info.compute_source(self, ShaderKind::Vertex);
+            pending.fs_source = program
+                .source_info
+                .compute_source(self, ShaderKind::Fragment);
+            source_bytes = match source_bytes
+                .checked_add(pending.vs_source.len())
+                .and_then(|n| n.checked_add(pending.fs_source.len()))
+            {
+                Some(n) if n <= 4 * 1024 * 1024 => n,
+                _ => return Ok(None), // Owner guards clean up; no shader submission occurred.
+            };
+            program.pending_source = Some(pending);
+            programs.push(owned);
+        }
+        // The same helper is exercised by the real ordering/negative-control tests.
+        submit_source_programs(&mut programs, requests);
+        Ok(Some(programs))
     }
 
     pub fn compile_shader(
@@ -2531,6 +2976,9 @@ impl Device {
         descriptor: &VertexDescriptor,
     ) -> Result<(), ShaderError> {
         profile_scope!("compile shader");
+        // Disposable diagnostic overlay: bridge this existing cache/link scope
+        // to the embedder's opt-in hooks. No shader or graphics work changes.
+        profile_marker!("loom shader cache compile link");
 
         let _guard = CrashAnnotatorGuard::new(
             &self.crash_annotator,
@@ -2539,40 +2987,73 @@ impl Device {
         );
 
         assert!(!program.is_initialized());
+        if let Some(ref error) = program.cohort_error {
+            return Err(error.clone());
+        }
+        if let Some(pending) = program.pending_source.take() {
+            match pending.finish() {
+                Ok(id) => {
+                    program.id = id;
+                    program.u_transform = self.gl.get_uniform_location(id, "uTransform");
+                    program.u_texture_size = self.gl.get_uniform_location(id, "uTextureSize");
+                    program.is_initialized = true;
+                    program.source_cleanup = None;
+                    return Ok(());
+                }
+                Err(error) => {
+                    // No serial retry-to-green within this failed draw.
+                    program.cohort_error = Some(error.clone());
+                    return Err(error);
+                }
+            }
+        }
         let mut build_program = true;
         let info = &program.source_info;
 
-        // See if we hit the binary shader cache
+        // See if we hit the binary shader cache.
         if let Some(ref cached_programs) = self.cached_programs {
-            // If the shader is not in the cache, attempt to load it from disk
-            if cached_programs.entries.borrow().get(&program.source_info.digest).is_none() {
+            if cached_programs.entries.borrow().get(&info.digest).is_none() {
                 if let Some(ref handler) = cached_programs.program_cache_handler {
-                    handler.try_load_shader_from_disk(&program.source_info.digest, cached_programs);
-                    if let Some(entry) = cached_programs.entries.borrow().get(&program.source_info.digest) {
-                        self.gl.program_binary(program.id, entry.binary.format, &entry.binary.bytes);
+                    handler.try_load_shader_from_disk(&info.digest, cached_programs);
+                    let binary = cached_programs
+                        .entries
+                        .borrow()
+                        .get(&info.digest)
+                        .map(|entry| entry.binary.clone());
+                    if let Some(binary) = binary {
+                        submit_cache_binary(
+                            &CacheGl(&*self.gl),
+                            program.id,
+                            binary.format,
+                            &binary.bytes,
+                        )
+                        .map_err(|error| self.cache_shader_error(info.base_filename, error))?;
                     }
                 }
             }
-
-            if let Some(entry) = cached_programs.entries.borrow_mut().get_mut(&info.digest) {
-                let mut link_status = [0];
-                unsafe {
-                    self.gl.get_program_iv(program.id, gl::LINK_STATUS, &mut link_status);
-                }
-                if link_status[0] == 0 {
-                    let error_log = self.gl.get_program_info_log(program.id);
-                    error!(
-                      "Failed to load a program object with a program binary: {} renderer {}\n{}",
-                      &info.base_filename,
-                      self.capabilities.renderer_name,
-                      error_log
-                    );
-                    if let Some(ref program_cache_handler) = cached_programs.program_cache_handler {
-                        program_cache_handler.notify_program_binary_failed(&entry.binary);
+            let binary = cached_programs
+                .entries
+                .borrow()
+                .get(&info.digest)
+                .map(|entry| entry.binary.clone());
+            if let Some(binary) = binary {
+                match inspect_cache_binary(&CacheGl(&*self.gl), program.id)
+                    .map_err(|error| self.cache_shader_error(info.base_filename, error))?
+                {
+                    CacheLink::Rejected(error_log) => {
+                        // Only error-free LINK_STATUS false is recoverable.
+                        warn!("Rejected cached program binary; compiling original source: {} digest {} renderer {}\n{}",
+                            info.base_filename, info.digest, self.capabilities.renderer_name, error_log);
+                        reject_cache_binary(cached_programs, &info.digest, &binary);
                     }
-                } else {
-                    entry.linked = true;
-                    build_program = false;
+                    CacheLink::Linked => {
+                        if let Some(entry) =
+                            cached_programs.entries.borrow_mut().get_mut(&info.digest)
+                        {
+                            entry.linked = true;
+                        }
+                        build_program = false;
+                    }
                 }
             }
         }
@@ -2645,7 +3126,10 @@ impl Device {
                     &info.base_filename,
                     error_log
                 );
+                // The caller still owns Program; zero after deletion so both
+                // local error cleanup and later lazy-shader deinit are safe.
                 self.gl.delete_program(program.id);
+                program.id = 0;
                 return Err(ShaderError::Link(info.base_filename.to_owned(), error_log));
             }
 
@@ -3128,8 +3612,7 @@ impl Device {
     }
 
     pub fn delete_program(&mut self, mut program: Program) {
-        self.gl.delete_program(program.id);
-        program.id = 0;
+        discard_program(&CacheGl(&*self.gl), &mut program);
     }
 
     /// Create a shader program and link it immediately.
@@ -3140,8 +3623,8 @@ impl Device {
         descriptor: &VertexDescriptor,
     ) -> Result<Program, ShaderError> {
         let mut program = self.create_program(base_filename, features)?;
-        self.link_program(&mut program, descriptor)?;
-        Ok(program)
+        let result = self.link_program(&mut program, descriptor);
+        finish_created_program(&CacheGl(&*self.gl), program, result)
     }
 
     /// Create a shader program. This does minimal amount of work to start
@@ -3161,10 +3644,20 @@ impl Device {
         // Create program
         let pid = self.gl.create_program();
 
-        // Attempt to load a cached binary if possible.
-        if let Some(ref cached_programs) = self.cached_programs {
-            if let Some(entry) = cached_programs.entries.borrow().get(&source_info.digest) {
-                self.gl.program_binary(pid, entry.binary.format, &entry.binary.bytes);
+        // Preserve early submission/ASYNC overlap without a status wait.
+        let binary = self.cached_programs.as_ref().and_then(|cache| {
+            cache
+                .entries
+                .borrow()
+                .get(&source_info.digest)
+                .map(|entry| entry.binary.clone())
+        });
+        if let Some(binary) = binary {
+            if let Err(error) =
+                submit_cache_binary(&CacheGl(&*self.gl), pid, binary.format, &binary.bytes)
+            {
+                self.gl.delete_program(pid);
+                return Err(self.cache_shader_error(base_filename, error));
             }
         }
 
@@ -3175,6 +3668,9 @@ impl Device {
             u_texture_size: 0,
             source_info,
             is_initialized: false,
+            pending_source: None,
+            cohort_error: None,
+            source_cleanup: None,
         };
 
         Ok(program)
@@ -4918,5 +5414,575 @@ impl<'a> TextureUploader<'a> {
 fn texels_to_u8_slice<T: Texel>(texels: &[T]) -> &[u8] {
     unsafe {
         slice::from_raw_parts(texels.as_ptr() as *const u8, texels.len() * mem::size_of::<T>())
+    }
+}
+
+#[cfg(test)]
+mod cache_binary_recovery_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    struct Ops {
+        errors: RefCell<VecDeque<gl::GLenum>>,
+        calls: RefCell<Vec<&'static str>>,
+        status: gl::GLint,
+        deletes: RefCell<Vec<gl::GLuint>>,
+    }
+    impl Ops {
+        fn new(errors: &[gl::GLenum], status: gl::GLint) -> Self {
+            Self {
+                errors: RefCell::new(errors.iter().copied().collect()),
+                calls: RefCell::new(Vec::new()),
+                status,
+                deletes: RefCell::new(Vec::new()),
+            }
+        }
+    }
+    impl CacheGlOps for Ops {
+        fn error(&self) -> gl::GLenum {
+            self.calls.borrow_mut().push("error");
+            self.errors.borrow_mut().pop_front().unwrap_or(gl::NO_ERROR)
+        }
+        fn binary(&self, _: gl::GLuint, _: gl::GLenum, _: &[u8]) {
+            self.calls.borrow_mut().push("binary");
+        }
+        fn status(&self, _: gl::GLuint) -> gl::GLint {
+            self.calls.borrow_mut().push("status");
+            self.status
+        }
+        fn info_log(&self, _: gl::GLuint) -> String {
+            self.calls.borrow_mut().push("log");
+            "rejected".into()
+        }
+        fn delete(&self, id: gl::GLuint) {
+            self.deletes.borrow_mut().push(id);
+        }
+    }
+    #[test]
+    fn early_binary_submission_does_not_wait_for_status() {
+        let ops = Ops::new(&[0, 0], 1);
+        assert_eq!(submit_cache_binary(&ops, 7, 1, &[1]), Ok(()));
+        assert_eq!(*ops.calls.borrow(), ["error", "binary", "error"]);
+    }
+    #[test]
+    fn prior_error_suppresses_submission_without_draining_other_flags() {
+        let ops = Ops::new(&[gl::INVALID_ENUM, gl::OUT_OF_MEMORY], 1);
+        assert!(
+            submit_cache_binary(&ops, 7, 1, &[1]).is_err(),
+            "pre-existing cache GL error must be fatal"
+        );
+        assert_eq!(*ops.calls.borrow(), ["error"]);
+        assert_eq!(ops.errors.borrow().front(), Some(&gl::OUT_OF_MEMORY));
+    }
+    #[test]
+    fn every_nonzero_submission_error_is_fatal() {
+        for code in [
+            gl::INVALID_ENUM,
+            gl::INVALID_VALUE,
+            gl::INVALID_OPERATION,
+            gl::OUT_OF_MEMORY,
+            0x0507,
+        ] {
+            let ops = Ops::new(&[code, gl::OUT_OF_MEMORY], 1);
+            assert_eq!(
+                submit_cache_binary(&ops, 7, 1, &[1]).unwrap_err().phase,
+                "before binary submission"
+            );
+            assert_eq!(*ops.calls.borrow(), ["error"]);
+            let ops = Ops::new(&[0, code, gl::OUT_OF_MEMORY], 1);
+            assert_eq!(
+                submit_cache_binary(&ops, 7, 1, &[1]).unwrap_err().phase,
+                "after binary submission"
+            );
+            assert_eq!(*ops.calls.borrow(), ["error", "binary", "error"]);
+            assert_eq!(ops.errors.borrow().front(), Some(&gl::OUT_OF_MEMORY));
+        }
+    }
+    #[test]
+    fn query_errors_never_return_a_recoverable_disposition() {
+        let cases: [(&[u32], &[&str], &str); 3] = [
+            (
+                &[gl::INVALID_OPERATION, gl::OUT_OF_MEMORY],
+                &["error"],
+                "before binary status query",
+            ),
+            (
+                &[0, gl::INVALID_OPERATION, gl::OUT_OF_MEMORY],
+                &["error", "status", "error"],
+                "after binary status query",
+            ),
+            (
+                &[0, 0, gl::INVALID_OPERATION, gl::OUT_OF_MEMORY],
+                &["error", "status", "error", "log", "error"],
+                "after binary info-log query",
+            ),
+        ];
+        for (errors, calls, phase) in cases {
+            let ops = Ops::new(errors, 0);
+            assert_eq!(inspect_cache_binary(&ops, 7).unwrap_err().phase, phase);
+            assert_eq!(ops.calls.borrow().as_slice(), calls);
+            assert_eq!(ops.errors.borrow().front(), Some(&gl::OUT_OF_MEMORY));
+        }
+    }
+    #[test]
+    fn only_error_free_false_status_requests_source_fallback() {
+        let ops = Ops::new(&[0, 0, 0], 0);
+        assert_eq!(
+            inspect_cache_binary(&ops, 7),
+            Ok(CacheLink::Rejected("rejected".into()))
+        );
+        assert_eq!(
+            *ops.calls.borrow(),
+            ["error", "status", "error", "log", "error"]
+        );
+        let ops = Ops::new(&[0, 0], 1);
+        assert_eq!(inspect_cache_binary(&ops, 7), Ok(CacheLink::Linked));
+        assert_eq!(*ops.calls.borrow(), ["error", "status", "error"]);
+    }
+
+    struct Reenter {
+        cache: Rc<RefCell<Option<std::rc::Weak<ProgramCache>>>>,
+        called: Rc<Cell<bool>>,
+    }
+    impl ProgramCacheObserver for Reenter {
+        fn save_shaders_to_disk(&self, _: Vec<Arc<ProgramBinary>>) {}
+        fn set_startup_shaders(&self, _: Vec<Arc<ProgramBinary>>) {}
+        fn try_load_shader_from_disk(&self, _: &ProgramSourceDigest, _: &Rc<ProgramCache>) {}
+        fn notify_program_binary_failed(&self, binary: &Arc<ProgramBinary>) {
+            let cache = self.cache.borrow().as_ref().unwrap().upgrade().unwrap();
+            let mut entries = cache.entries.borrow_mut();
+            assert!(!entries.contains_key(binary.source_digest()));
+            entries.clear();
+            self.called.set(true);
+        }
+    }
+    #[test]
+    fn rejection_removes_entry_before_real_reentrant_observer() {
+        let slot = Rc::new(RefCell::new(None));
+        let called = Rc::new(Cell::new(false));
+        let cache = ProgramCache::new(Some(Box::new(Reenter {
+            cache: slot.clone(),
+            called: called.clone(),
+        })));
+        *slot.borrow_mut() = Some(Rc::downgrade(&cache));
+        let binary = Arc::new(ProgramBinary::new(
+            vec![1],
+            1,
+            ProgramSourceDigest::default(),
+        ));
+        cache.add_new_program_binary(binary.clone());
+        reject_cache_binary(&cache, binary.source_digest(), &binary);
+        assert!(called.get());
+        assert!(cache.entries.borrow().is_empty());
+    }
+    fn program(id: gl::GLuint) -> Program {
+        Program {
+            id,
+            u_transform: 0,
+            u_texture_size: 0,
+            is_initialized: false,
+            pending_source: None,
+            cohort_error: None,
+            source_cleanup: None,
+            source_info: ProgramSourceInfo {
+                base_filename: "test",
+                features: Vec::new(),
+                full_name_cstr: Rc::new(std::ffi::CString::new("test").unwrap()),
+                source_type: ProgramSourceType::Unoptimized,
+                digest: ProgramSourceDigest::default(),
+            },
+        }
+    }
+    #[test]
+    fn actual_owned_error_cleanup_deletes_once_and_disarms_drop() {
+        let ops = Ops::new(&[], 0);
+        let result = finish_created_program(
+            &ops,
+            program(7),
+            Err(ShaderError::Link("test".into(), "fatal".into())),
+        );
+        assert!(result.is_err());
+        assert_eq!(*ops.deletes.borrow(), [7]);
+        let mut already_deleted = program(0);
+        discard_program(&ops, &mut already_deleted);
+        assert_eq!(*ops.deletes.borrow(), [7]);
+        let mut live = match finish_created_program(&ops, program(9), Ok(())) {
+            Ok(p) => p,
+            Err(_) => panic!("unexpected failure"),
+        };
+        assert_eq!(live.id, 9);
+        assert_eq!(*ops.deletes.borrow(), [7]);
+        discard_program(&ops, &mut live);
+        discard_program(&ops, &mut live);
+        assert_eq!(*ops.deletes.borrow(), [7, 9]);
+    }
+}
+
+#[cfg(test)]
+mod source_program_cohort_tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Call {
+        Create(gl::GLenum, u32),
+        Source(u32, String),
+        Compile(u32),
+        Attach(u32, u32),
+        Detach(u32, u32),
+        Attribute(u32, u32, String),
+        Link(u32),
+        ShaderLog(u32),
+        ShaderStatus(u32),
+        ProgramLog(u32),
+        ProgramStatus(u32),
+        DeleteShader(u32),
+        DeleteProgram(u32),
+    }
+    struct Ops {
+        next: Cell<u32>,
+        calls: RefCell<Vec<Call>>,
+        failed_shader: Cell<u32>,
+        failed_program: Cell<u32>,
+        panic_compile: Cell<u32>,
+    }
+    impl Ops {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                next: Cell::new(1),
+                calls: RefCell::new(Vec::new()),
+                failed_shader: Cell::new(0),
+                failed_program: Cell::new(0),
+                panic_compile: Cell::new(0),
+            })
+        }
+        fn record(&self, call: Call) {
+            self.calls.borrow_mut().push(call);
+        }
+        fn assert_deleted_once(&self, programs: &[u32], shaders: &[u32]) {
+            let calls = self.calls.borrow();
+            for id in programs {
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|x| **x == Call::DeleteProgram(*id))
+                        .count(),
+                    1
+                );
+            }
+            for id in shaders {
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|x| **x == Call::DeleteShader(*id))
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|x| matches!(x, Call::DeleteProgram(_)))
+                    .count(),
+                programs.len()
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|x| matches!(x, Call::DeleteShader(_)))
+                    .count(),
+                shaders.len()
+            );
+        }
+    }
+    impl SourceLinkOps for Ops {
+        fn create_shader(&self, kind: u32) -> u32 {
+            let id = self.next.get();
+            self.next.set(id + 1);
+            self.record(Call::Create(kind, id));
+            id
+        }
+        fn source(&self, s: u32, source: &str) {
+            self.record(Call::Source(s, source.into()));
+        }
+        fn compile(&self, s: u32) {
+            self.record(Call::Compile(s));
+            assert_ne!(self.panic_compile.get(), s, "injected submission unwind");
+        }
+        fn attach(&self, p: u32, s: u32) {
+            self.record(Call::Attach(p, s));
+        }
+        fn detach(&self, p: u32, s: u32) {
+            self.record(Call::Detach(p, s));
+        }
+        fn attribute(&self, p: u32, i: u32, n: &str) {
+            self.record(Call::Attribute(p, i, n.into()));
+        }
+        fn link(&self, p: u32) {
+            self.record(Call::Link(p));
+        }
+        fn shader_log(&self, s: u32) -> String {
+            self.record(Call::ShaderLog(s));
+            "diagnostic".into()
+        }
+        fn shader_status(&self, s: u32) -> i32 {
+            self.record(Call::ShaderStatus(s));
+            i32::from(self.failed_shader.get() != s)
+        }
+        fn program_log(&self, p: u32) -> String {
+            self.record(Call::ProgramLog(p));
+            "link diagnostic".into()
+        }
+        fn program_status(&self, p: u32) -> i32 {
+            self.record(Call::ProgramStatus(p));
+            i32::from(self.failed_program.get() != p)
+        }
+        fn delete_shader(&self, s: u32) {
+            self.record(Call::DeleteShader(s));
+        }
+        fn delete_program(&self, p: u32) {
+            self.record(Call::DeleteProgram(p));
+        }
+    }
+    fn info(name: &'static str) -> ProgramSourceInfo {
+        ProgramSourceInfo {
+            base_filename: name,
+            features: Vec::new(),
+            full_name_cstr: Rc::new(std::ffi::CString::new(name).unwrap()),
+            source_type: ProgramSourceType::Unoptimized,
+            digest: ProgramSourceDigest::default(),
+        }
+    }
+    fn owned(ops: Rc<dyn SourceLinkOps>, id: u32, name: &'static str) -> OwnedSourceProgram {
+        let info = info(name);
+        let mut pending = PendingSourceLink::new(ops.clone(), id, &info);
+        pending.vs_source = format!("vertex:{}", name);
+        pending.fs_source = format!("fragment:{}", name);
+        OwnedSourceProgram(Some(Program {
+            id: 0,
+            u_transform: 0,
+            u_texture_size: 0,
+            source_info: info,
+            is_initialized: false,
+            pending_source: Some(pending),
+            cohort_error: None,
+            source_cleanup: Some(ops),
+        }))
+    }
+    fn request(name: &'static str) -> SourceProgramRequest {
+        SourceProgramRequest {
+            name,
+            features: Vec::new(),
+            descriptor: &crate::renderer::desc::PRIM_INSTANCES,
+        }
+    }
+    fn query(call: &Call) -> bool {
+        matches!(
+            call,
+            Call::ShaderLog(_)
+                | Call::ShaderStatus(_)
+                | Call::ProgramLog(_)
+                | Call::ProgramStatus(_)
+        )
+    }
+
+    #[test]
+    fn source_cohort_default_is_only_windows_angle_d3d11() {
+        let d11 = "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11-driver)";
+        assert!(source_program_cohort_admitted(true, d11, None));
+        assert!(!source_program_cohort_admitted(false, d11, None));
+        for other in [
+            "NVIDIA GeForce RTX 3070",
+            "ANGLE (NVIDIA, Vulkan 1.3)",
+            "ANGLE (Apple, Metal Renderer: Apple M2)",
+            "Software WebRender",
+        ] {
+            assert!(!source_program_cohort_admitted(true, other, None));
+        }
+    }
+
+    #[test]
+    fn source_cohort_explicit_control_preserves_serial_and_old_diagnostic_admission() {
+        let d11 = "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11-driver)";
+        assert!(!source_program_cohort_admitted(true, d11, Some(false)));
+        // True is obtained only from the unchanged Oracle/profile diagnostic
+        // gate. Device GLES/KHR/cache/override capabilities are still separate.
+        assert!(source_program_cohort_admitted(
+            false,
+            "other backend",
+            Some(true)
+        ));
+        assert!(!source_program_cohort_admitted(
+            false,
+            "other backend",
+            None
+        ));
+    }
+
+    #[test]
+    fn source_cohort_actual_batch_submits_every_program_before_any_wait() {
+        let ops = Ops::new();
+        let mut programs = vec![
+            owned(ops.clone(), 7, "first"),
+            owned(ops.clone(), 8, "second"),
+        ];
+        submit_source_programs(&mut programs, &[request("first"), request("second")]);
+        let submitted = ops.calls.borrow().clone();
+        assert!(
+            !submitted.iter().any(query),
+            "a status/info wait serialized the submitted cohort"
+        );
+        assert_eq!(
+            submitted
+                .iter()
+                .filter(|x| matches!(x, Call::Compile(_)))
+                .count(),
+            4
+        );
+        assert_eq!(
+            submitted
+                .iter()
+                .filter(|x| matches!(x, Call::Link(_)))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [Call::Link(7), Call::Link(8)]
+        );
+        assert!(submitted.contains(&Call::Source(1, "vertex:first".into())));
+        assert!(submitted.contains(&Call::Source(2, "fragment:first".into())));
+        assert!(submitted.contains(&Call::Source(3, "vertex:second".into())));
+        assert!(submitted.contains(&Call::Source(4, "fragment:second".into())));
+        for p in &mut programs {
+            let p = p.0.as_mut().unwrap();
+            assert!(!p.is_initialized());
+            p.id = p.pending_source.take().unwrap().finish().unwrap();
+        }
+        let calls = ops.calls.borrow().clone();
+        let first_query = calls.iter().position(query).unwrap();
+        let last_link = calls
+            .iter()
+            .rposition(|x| matches!(x, Call::Link(_)))
+            .unwrap();
+        assert!(
+            last_link < first_query,
+            "not all actual program links preceded the first wait"
+        );
+        let statuses = calls
+            .iter()
+            .filter(|x| query(x))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                Call::ShaderLog(1),
+                Call::ShaderStatus(1),
+                Call::ShaderLog(2),
+                Call::ShaderStatus(2),
+                Call::ProgramStatus(7),
+                Call::ShaderLog(3),
+                Call::ShaderStatus(3),
+                Call::ShaderLog(4),
+                Call::ShaderStatus(4),
+                Call::ProgramStatus(8)
+            ]
+        );
+        drop(programs);
+        ops.assert_deleted_once(&[7, 8], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn source_cohort_unconsumed_cancel_releases_actual_owned_ids_once() {
+        let ops = Ops::new();
+        let mut programs = vec![
+            owned(ops.clone(), 7, "first"),
+            owned(ops.clone(), 8, "second"),
+        ];
+        submit_source_programs(&mut programs, &[request("first"), request("second")]);
+        drop(programs);
+        assert!(!ops.calls.borrow().iter().any(query));
+        ops.assert_deleted_once(&[7, 8], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn source_cohort_vertex_or_fragment_failure_is_fatal_and_cleans_remaining_cohort() {
+        for failed in [1, 2] {
+            let ops = Ops::new();
+            ops.failed_shader.set(failed);
+            let mut programs = vec![
+                owned(ops.clone(), 7, "first"),
+                owned(ops.clone(), 8, "second"),
+            ];
+            submit_source_programs(&mut programs, &[request("first"), request("second")]);
+            let error = programs[0]
+                .0
+                .as_mut()
+                .unwrap()
+                .pending_source
+                .take()
+                .unwrap()
+                .finish()
+                .unwrap_err();
+            assert!(matches!(error, ShaderError::Compilation(_, _)));
+            assert!(!ops
+                .calls
+                .borrow()
+                .iter()
+                .any(|x| matches!(x, Call::ProgramStatus(_))));
+            drop(programs);
+            ops.assert_deleted_once(&[7, 8], &[1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn source_cohort_link_failure_is_fatal_and_releases_program_once() {
+        let ops = Ops::new();
+        ops.failed_program.set(7);
+        let mut programs = vec![
+            owned(ops.clone(), 7, "first"),
+            owned(ops.clone(), 8, "second"),
+        ];
+        submit_source_programs(&mut programs, &[request("first"), request("second")]);
+        let error = programs[0]
+            .0
+            .as_mut()
+            .unwrap()
+            .pending_source
+            .take()
+            .unwrap()
+            .finish()
+            .unwrap_err();
+        assert!(matches!(error, ShaderError::Link(_, _)));
+        drop(programs);
+        ops.assert_deleted_once(&[7, 8], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn source_cohort_partial_submit_unwind_never_detaches_unattached_shader() {
+        let ops = Ops::new();
+        ops.panic_compile.set(4);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut programs = vec![
+                owned(ops.clone(), 7, "first"),
+                owned(ops.clone(), 8, "second"),
+            ];
+            submit_source_programs(&mut programs, &[request("first"), request("second")]);
+        }));
+        assert!(result.is_err());
+        let calls = ops.calls.borrow();
+        assert!(!calls.contains(&Call::Detach(8, 3)) && !calls.contains(&Call::Detach(8, 4)));
+        drop(calls);
+        ops.assert_deleted_once(&[7, 8], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn source_cohort_preparation_cancel_before_submit_deletes_only_programs() {
+        let ops = Ops::new();
+        let programs = vec![
+            owned(ops.clone(), 7, "first"),
+            owned(ops.clone(), 8, "second"),
+        ];
+        drop(programs);
+        ops.assert_deleted_once(&[7, 8], &[]);
     }
 }
