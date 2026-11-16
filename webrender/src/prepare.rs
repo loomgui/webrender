@@ -781,6 +781,7 @@ fn prepare_interned_prim_for_render(
                 common_data,
                 prim_info.snapped_local_rect.size(),
                 brush_segments,
+                frame_context.scene_properties,
                 frame_state,
             );
             scratch.frame.normal_border[nb_handle].gpu_address = gpu_address;

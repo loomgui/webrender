@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use api::{BorderStyle, NormalBorder, PremultipliedColorF, RasterSpace, Shadow};
+use api::{BorderStyle, ColorF, ColorU, NormalBorder, PremultipliedColorF, PropertyBinding, RasterSpace, Shadow};
 use api::units::*;
 use crate::border::{self, build_border_instances, get_max_scale_for_border};
 use crate::border::NormalBorderAu;
@@ -10,6 +10,7 @@ use crate::gpu_types::ImageBrushPrimitiveData;
 use crate::render_backend::DataStores;
 use crate::render_task_cache::{RenderTaskCacheKey, RenderTaskCacheKeyKind, RenderTaskParent, to_cache_size};
 use crate::renderer::{GpuBufferAddress, GpuBufferWriterF};
+use crate::scene::SceneProperties;
 use crate::scene_building::{CreateShadow, IsVisible};
 use crate::frame_builder::{FrameBuildingContext, FrameBuildingState};
 use crate::intern;
@@ -118,6 +119,10 @@ impl NormalBorderScratch {
 pub struct NormalBorderPrim {
     pub border: NormalBorderAu,
     pub widths: LayoutSideOffsetsAu,
+    /// A color that multiplies the drawn border. It is not part of the
+    /// segments' render-task cache keys, so a bound tint can change without
+    /// re-rasterizing them.
+    pub tint: Option<PropertyBinding<ColorU>>,
 }
 
 pub type NormalBorderKey = PrimKey<NormalBorderPrim>;
@@ -142,6 +147,7 @@ impl intern::InternDebug for NormalBorderKey {}
 pub struct NormalBorderData {
     pub border: NormalBorder,
     pub widths: LayoutSideOffsets,
+    pub tint: Option<PropertyBinding<ColorF>>,
 }
 
 impl NormalBorderData {
@@ -154,15 +160,23 @@ impl NormalBorderData {
         common: &mut PrimTemplateCommonData,
         prim_size: LayoutSize,
         brush_segments: &[BrushSegment],
+        scene_properties: &SceneProperties,
         frame_state: &mut FrameBuildingState,
     ) -> GpuBufferAddress {
         let mut writer = frame_state.frame_gpu_data.f32.write_blocks(3 + brush_segments.len() * VECS_PER_SEGMENT);
+
+        // The cached segments already hold the side colors. A tint multiplies
+        // them, resolved here each frame so a bound tint needs no new scene.
+        let color = match self.tint {
+            Some(ref tint) => scene_properties.resolve_color(tint).premultiplied(),
+            None => PremultipliedColorF::WHITE,
+        };
 
         // Border primitives currently used for
         // image borders, and run through the
         // normal brush_image shader.
         writer.push(&ImageBrushPrimitiveData {
-            color: PremultipliedColorF::WHITE,
+            color,
             background_color: PremultipliedColorF::WHITE,
             stretch_size: prim_size,
         });
@@ -269,6 +283,7 @@ impl From<NormalBorderKey> for NormalBorderTemplate {
             kind: NormalBorderData {
                 border,
                 widths,
+                tint: key.kind.tint.map(Into::into),
             }
         }
     }
@@ -316,6 +331,8 @@ impl CreateShadow for NormalBorderPrim {
         NormalBorderPrim {
             border,
             widths: self.widths,
+            // The shadow color replaces the side colors; it is not tinted.
+            tint: None,
         }
     }
 }
@@ -551,9 +568,9 @@ fn test_struct_sizes() {
     //     test expectations and move on.
     // (b) You made a structure larger. This is not necessarily a problem, but should only
     //     be done with care, and after checking if talos performance regresses badly.
-    assert_eq!(mem::size_of::<NormalBorderPrim>(), 84, "NormalBorderPrim size changed");
-    assert_eq!(mem::size_of::<NormalBorderTemplate>(), 140, "NormalBorderTemplate size changed");
-    assert_eq!(mem::size_of::<NormalBorderKey>(), 88, "NormalBorderKey size changed");
+    assert_eq!(mem::size_of::<NormalBorderPrim>(), 100, "NormalBorderPrim size changed");
+    assert_eq!(mem::size_of::<NormalBorderTemplate>(), 168, "NormalBorderTemplate size changed");
+    assert_eq!(mem::size_of::<NormalBorderKey>(), 104, "NormalBorderKey size changed");
     assert_eq!(mem::size_of::<ImageBorder>(), 68, "ImageBorder size changed");
     assert_eq!(mem::size_of::<ImageBorderTemplate>(), 104, "ImageBorderTemplate size changed");
     assert_eq!(mem::size_of::<ImageBorderKey>(), 72, "ImageBorderKey size changed");

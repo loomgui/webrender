@@ -1341,6 +1341,28 @@ impl DisplayListBuilder {
             bounds,
             details,
             widths,
+            tint: None,
+        });
+
+        self.push_item(&item);
+    }
+
+    /// Push a normal border that is drawn multiplied by `tint`. With opaque
+    /// white sides the border takes the tint color, which may be a binding.
+    pub fn push_border_with_tint(
+        &mut self,
+        common: &di::CommonItemProperties,
+        bounds: LayoutRect,
+        widths: LayoutSideOffsets,
+        details: di::BorderDetails,
+        tint: PropertyBinding<ColorF>,
+    ) {
+        let item = di::DisplayItem::Border(di::BorderDisplayItem {
+            common: *common,
+            bounds,
+            details,
+            widths,
+            tint: Some(tint),
         });
 
         self.push_item(&item);
