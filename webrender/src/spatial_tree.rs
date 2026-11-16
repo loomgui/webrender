@@ -367,9 +367,11 @@ impl SceneSpatialTree {
     ) -> SpatialNodeIndex {
         let parent_info = self.get_snapping_info(node.parent);
 
+        // Scene building only knows the default value of a bound transform.
         node.snapping_transform = calculate_snapping_transform(
             parent_info,
             &node.descriptor.node_type,
+            None,
         );
 
         let descriptor = node.descriptor.clone();
@@ -411,9 +413,13 @@ impl SceneSpatialTree {
                     PropertyBinding::Value(m) => {
                         !m.is_2d_scale_translation()
                     }
-                    PropertyBinding::Binding(..) => {
-                        // Animated, so assume it may introduce a complex transform
-                        true
+                    PropertyBinding::Binding(_, ref default) => {
+                        // A bound transform is classified by its default value, the
+                        // same as an unbound one, so that binding a transform does not
+                        // change how its contents are drawn. A client that updates the
+                        // binding must rebuild the scene when the new value is no longer
+                        // a 2d scale/translation (or becomes one).
+                        !default.is_2d_scale_translation()
                     }
                 }
             }
@@ -1043,6 +1049,7 @@ impl SpatialTree {
         node.snapping_transform = calculate_snapping_transform(
             parent_info,
             &node.node_type,
+            Some(scene_properties),
         );
 
         node.update(
@@ -1224,6 +1231,7 @@ pub fn get_external_scroll_offset<S: SpatialNodeContainer>(
 fn calculate_snapping_transform(
     parent_scale_offset: Option<ScaleOffset>,
     node_type: &SpatialNodeType,
+    scene_properties: Option<&SceneProperties>,
 ) -> Option<ScaleOffset> {
     // We need to incorporate the parent scale/offset with the child.
     // If the parent does not have a scale/offset, then we know we are
@@ -1238,24 +1246,27 @@ fn calculate_snapping_transform(
         SpatialNodeType::ReferenceFrame(ref info) => {
             let origin_offset = info.origin_in_parent_reference_frame;
 
-            match info.source_transform {
-                PropertyBinding::Value(ref value) => {
-                    // We can only get a ScaleOffset if the transform is 2d axis
-                    // aligned.
-                    match ScaleOffset::from_transform(value) {
-                        Some(scale_offset) => {
-                            scale_offset.then(&ScaleOffset::from_offset(origin_offset.to_untyped()))
-                        }
-                        None => return None,
+            // A bound transform snaps like the same transform given as a value:
+            // a frame built after a property update then matches the frame of a
+            // scene rebuilt with the new value. Frame building resolves the
+            // current value; scene building only has the binding's default.
+            let value = match info.source_transform {
+                PropertyBinding::Value(value) => value,
+                PropertyBinding::Binding(_, default) => match scene_properties {
+                    Some(scene_properties) => {
+                        scene_properties.resolve_layout_transform(&info.source_transform)
                     }
-                }
+                    None => default,
+                },
+            };
 
-                // Assume animations start at the identity transform for snapping purposes.
-                // We still want to incorporate the reference frame offset however.
-                // TODO(aosmond): Is there a better known starting point?
-                PropertyBinding::Binding(..) => {
-                    ScaleOffset::from_offset(origin_offset.to_untyped())
+            // We can only get a ScaleOffset if the transform is 2d axis
+            // aligned.
+            match ScaleOffset::from_transform(&value) {
+                Some(scale_offset) => {
+                    scale_offset.then(&ScaleOffset::from_offset(origin_offset.to_untyped()))
                 }
+                None => return None,
             }
         }
         _ => ScaleOffset::identity(),
@@ -1954,4 +1965,84 @@ fn test_is_ancestor_or_self_zooming() {
     assert!(st.get_spatial_node(root).is_ancestor_or_self_zooming);
     assert!(st.get_spatial_node(child1).is_ancestor_or_self_zooming);
     assert!(st.get_spatial_node(child2).is_ancestor_or_self_zooming);
+}
+
+#[cfg(test)]
+fn add_bound_reference_frame(
+    cst: &mut SceneSpatialTree,
+    transform: PropertyBinding<LayoutTransform>,
+    is_2d_scale_translation: bool,
+    origin_in_parent_reference_frame: LayoutVector2D,
+) -> SpatialNodeIndex {
+    let parent = cst.root_reference_frame_index();
+    cst.add_reference_frame(
+        parent,
+        TransformStyle::Flat,
+        transform,
+        ReferenceFrameKind::Transform {
+            is_2d_scale_translation,
+            should_snap: false,
+            paired_with_perspective: false,
+        },
+        origin_in_parent_reference_frame,
+        PipelineId::dummy(),
+        false,
+    )
+}
+
+/// A bound transform must be drawn like the same transform given as a value,
+/// both before and after its property is updated without a new scene.
+#[test]
+fn test_bound_transform_snaps_and_classifies_like_a_value() {
+    use api::{DynamicProperties, PropertyBindingKey, PropertyValue};
+
+    let key = PropertyBindingKey::<LayoutTransform>::new(7);
+    let origin = LayoutVector2D::new(10.25, 0.0);
+    let first = LayoutTransform::translation(3.5, 2.0, 0.0);
+    let second = LayoutTransform::translation(40.75, -6.5, 0.0);
+
+    let snapping_and_root = |transform: PropertyBinding<LayoutTransform>,
+                             properties: &SceneProperties| {
+        let mut cst = SceneSpatialTree::new();
+        let frame = add_bound_reference_frame(&mut cst, transform, false, origin);
+        let scene_snapping = cst.get_node_info(frame).snapping_transform;
+        let is_root_coord_system = cst.is_root_coord_system(frame);
+        let mut st = SpatialTree::new();
+        st.apply_updates(cst.end_frame_and_get_pending_updates());
+        st.update_tree(properties);
+        (
+            scene_snapping,
+            st.get_node_info(frame).snapping_transform,
+            is_root_coord_system,
+        )
+    };
+
+    let none = SceneProperties::new();
+    let mut updated = SceneProperties::new();
+    updated.add_properties(DynamicProperties {
+        transforms: vec![PropertyValue { key, value: second }],
+        floats: Vec::new(),
+        colors: Vec::new(),
+    });
+    assert!(updated.flush_pending_updates());
+
+    // Without an update, the binding behaves like its default value.
+    let value = snapping_and_root(PropertyBinding::Value(first), &none);
+    let bound = snapping_and_root(PropertyBinding::Binding(key, first), &none);
+    assert_eq!(bound, value);
+    assert!(bound.2, "a 2d translation stays in the root coordinate system");
+
+    // After an update, frame building snaps with the new value, as a scene
+    // rebuilt with that value would.
+    let rebuilt = snapping_and_root(PropertyBinding::Value(second), &none);
+    let moved = snapping_and_root(PropertyBinding::Binding(key, first), &updated);
+    assert_eq!(moved.1, rebuilt.1);
+    assert_ne!(moved.1, value.1);
+
+    // A bound rotation is still a complex transform.
+    let rotation = LayoutTransform::rotation(0.0, 0.0, 1.0, euclid::Angle::degrees(30.0));
+    let rotated = snapping_and_root(PropertyBinding::Binding(key, rotation), &none);
+    assert_eq!(rotated, snapping_and_root(PropertyBinding::Value(rotation), &none));
+    assert!(!rotated.2);
+    assert_eq!(rotated.1, None);
 }
