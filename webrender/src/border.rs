@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use api::{BorderRadius, BorderSide, BorderStyle, ColorF, ColorU};
-use api::{NormalBorder as ApiNormalBorder, RepeatMode};
+use api::{NormalBorder as ApiNormalBorder, PropertyBinding, RepeatMode};
 use api::units::*;
 use crate::clip::ClipNodeId;
 use crate::ellipse::Ellipse;
@@ -220,6 +220,7 @@ impl<'a> SceneBuilder<'a> {
         info: &LayoutPrimitiveInfo,
         border: &ApiNormalBorder,
         widths: LayoutSideOffsets,
+        tint: Option<PropertyBinding<ColorF>>,
         spatial_node_index: SpatialNodeIndex,
         clip_node_id: ClipNodeId,
     ) {
@@ -234,6 +235,7 @@ impl<'a> SceneBuilder<'a> {
             NormalBorderPrim {
                 border: border.into(),
                 widths: widths.to_au(),
+                tint: tint.map(Into::into),
             },
         );
     }

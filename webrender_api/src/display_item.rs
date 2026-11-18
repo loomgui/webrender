@@ -516,6 +516,11 @@ pub struct BorderDisplayItem {
     pub bounds: LayoutRect,
     pub widths: LayoutSideOffsets,
     pub details: BorderDetails,
+    /// A color that multiplies a normal border as it is drawn. Give the sides
+    /// an opaque white color to draw the whole border in this color; a bound
+    /// tint can then change without a new display list. Ignored by nine-patch
+    /// borders.
+    pub tint: Option<PropertyBinding<ColorF>>,
 }
 
 #[repr(C)]

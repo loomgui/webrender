@@ -3376,6 +3376,7 @@ impl<'a> SceneBuilder<'a> {
                     info,
                     border,
                     border_item.widths,
+                    border_item.tint,
                     spatial_node_index,
                     clip_node_id,
                 );

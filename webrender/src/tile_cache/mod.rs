@@ -2651,8 +2651,14 @@ impl TileCacheInstance {
                     });
                 }
             }
+            PrimitiveKind::NormalBorder { data_handle, .. } => {
+                // A bound tint changes what is drawn without a new scene.
+                if let Some(tint @ PropertyBinding::Binding(..)) = data_stores.normal_border[data_handle].kind.tint {
+                    let color_u: PropertyBinding<ColorU> = tint.into();
+                    prim_info.color_binding = Some(color_u.into());
+                }
+            }
             PrimitiveKind::LineDecoration { .. } |
-            PrimitiveKind::NormalBorder { .. } |
             PrimitiveKind::BoxShadow { .. } |
             PrimitiveKind::TextRun { .. } => {
                 // These don't contribute dependencies
